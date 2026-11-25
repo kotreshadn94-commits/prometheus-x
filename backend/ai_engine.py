@@ -1,92 +1,99 @@
-"""Image inference: ONNX PatchCore when installed, with an operational CV fallback."""
+"""PatchCore ONNX adapter plus a dependency-light OpenCV feature detector."""
+from __future__ import annotations
+
+import os
 from pathlib import Path
-import threading
+from threading import RLock
+
 import cv2
 import numpy as np
 
-MODEL_PATH = Path(__file__).resolve().parent / "model.onnx"
+MODEL_PATH = Path(os.getenv("PROMETHEUS_MODEL", Path(__file__).parent / "model.onnx"))
 
 
-class VisionEngine:
-    def __init__(self):
+class AnomalyEngine:
+    def __init__(self) -> None:
         self.session = None
         self.input_name = None
-        self.lock = threading.RLock()
-        self.normal_bank = []
-        self.baseline = None
-        if MODEL_PATH.exists():
+        self.lock = RLock()
+        self.memory_bank: list[np.ndarray] = []
+        self.model_mode = "opencv-feature-bank"
+        if MODEL_PATH.is_file():
             try:
                 import onnxruntime as ort
                 self.session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
                 self.input_name = self.session.get_inputs()[0].name
+                self.model_mode = "patchcore-onnx"
             except Exception as exc:
-                print(f"ONNX model unavailable; using CV engine: {exc}")
+                print(f"ONNX model unavailable ({exc}); using OpenCV feature detector")
+        # Reference descriptors represent smooth, evenly illuminated metal at
+        # several orientations. Runtime approvals add real production normals.
+        for angle in np.linspace(0, np.pi, 12, endpoint=False):
+            self.memory_bank.append(np.array([np.cos(angle), np.sin(angle), 0.03, 0.08], dtype=np.float32))
 
     @staticmethod
-    def features(image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        return np.concatenate([small.flatten(), np.array([gray.mean()/255, gray.std()/255], dtype=np.float32)])
+    def embedding(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        gray = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        return np.array([float(gx.mean()), float(gy.mean()), float(gx.std()), float(gy.std())], dtype=np.float32)
 
-    def analyze(self, image, stabilize=False):
-        source = image.copy()
-        if stabilize:
-            lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB)
-            lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
-            source = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        response = np.zeros((h, w), np.float32)
-        # Directional gradients and oriented Gabor kernels emphasize fine linear marks.
-        for angle in (0, 45, 90, 135):
-            rad = np.deg2rad(angle)
-            dx, dy = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-            directional = np.abs(dx*np.cos(rad) + dy*np.sin(rad))
-            kernel = cv2.getGaborKernel((15, 15), 3.0, rad, 8.0, 0.55, 0, ktype=cv2.CV_32F)
-            texture = np.abs(cv2.filter2D(gray.astype(np.float32), cv2.CV_32F, kernel))
-            response = np.maximum(response, 0.65*directional + 0.35*texture)
-        response = cv2.GaussianBlur(response, (5, 5), 0)
-        cv_heat = response / max(float(np.percentile(response, 99.5)), 1.0)
-        cv_heat = np.clip(cv_heat, 0, 1)
-        neural = None
+    def inject_normal(self, embedding: list[float] | np.ndarray) -> None:
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if vector.size:
+            with self.lock:
+                self.memory_bank.append(vector[:4])
+                self.memory_bank = self.memory_bank[-512:]
+
+    @staticmethod
+    def _directional_response(gray: np.ndarray) -> np.ndarray:
+        grayf = gray.astype(np.float32) / 255.0
+        responses = []
+        for theta in (0, np.pi / 4, np.pi / 2, 3 * np.pi / 4):
+            kernel = cv2.getGaborKernel((15, 15), 2.8, theta, 9.0, 0.65, 0, ktype=cv2.CV_32F)
+            filtered = cv2.filter2D(grayf, cv2.CV_32F, kernel)
+            responses.append(np.abs(filtered))
+        gx = cv2.Sobel(grayf, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(grayf, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.sqrt(gx * gx + gy * gy)
+        # Local contrast suppresses broad illumination changes, retaining thin edges.
+        local = cv2.absdiff(grayf, cv2.GaussianBlur(grayf, (0, 0), 2.2))
+        return np.maximum(np.max(np.stack(responses), axis=0) * 0.35 + gradient * 0.45 + local * 0.2, 0)
+
+    def infer(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edge_map = self._directional_response(gray)
         if self.session is not None:
             try:
-                input_shape = self.session.get_inputs()[0].shape
-                ih = int(input_shape[2]) if isinstance(input_shape[2], int) else 256
-                iw = int(input_shape[3]) if isinstance(input_shape[3], int) else 256
-                rgb = cv2.cvtColor(cv2.resize(source, (iw, ih)), cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
-                tensor = np.transpose(rgb, (2, 0, 1))[None]
-                out = self.session.run(None, {self.input_name: tensor})[0]
-                plane = np.asarray(out).squeeze()
-                if plane.ndim == 0:
-                    plane = np.full((ih, iw), float(plane), np.float32)
-                if plane.ndim == 1:
-                    plane = np.full((ih, iw), float(np.max(plane)), np.float32)
-                plane = cv2.resize(plane.astype(np.float32), (w, h))
-                lo, hi = np.percentile(plane, [5, 99])
-                neural = np.clip((plane-lo)/(hi-lo+1e-6), 0, 1)
+                resized = cv2.resize(image, (256, 256)).astype(np.float32) / 255.0
+                tensor = np.transpose(resized[:, :, ::-1], (2, 0, 1))[None].copy()
+                outputs = self.session.run(None, {self.input_name: tensor})
+                candidates = [np.asarray(value) for value in outputs if np.asarray(value).ndim >= 2]
+                if candidates:
+                    raw = np.squeeze(candidates[-1]).astype(np.float32)
+                    if raw.ndim == 0:
+                        raw = np.full((32, 32), float(raw), np.float32)
+                    if raw.ndim > 2:
+                        raw = np.max(raw, axis=tuple(range(raw.ndim - 2)))
+                    neural = cv2.resize(raw, (w, h))
+                    lo, hi = np.percentile(neural, 5), np.percentile(neural, 99.5)
+                    neural = np.clip((neural - lo) / max(float(hi - lo), 1e-6), 0, 1)
+                    edge = edge_map / max(float(np.percentile(edge_map, 99.5)), 1e-6)
+                    anomaly = np.clip(0.75 * neural + 0.25 * edge, 0, 1)
+                else:
+                    anomaly = edge_map
             except Exception as exc:
-                print(f"ONNX inference failed for this frame; using CV response: {exc}")
-        heat = cv_heat if neural is None else np.maximum(0.55*cv_heat, 0.45*neural)
-        features = self.features(source)
-        with self.lock:
-            # Approved normal examples influence the baseline conservatively.
-            if self.normal_bank:
-                distances = [float(np.mean(np.abs(features-x))) for x in self.normal_bank[-64:]]
-                if min(distances) < 0.08:
-                    heat *= 0.75
-        return {"heatmap": heat, "features": features, "image": source,
-                "engine": "onnx-patchcore+opencv" if neural is not None else "opencv-directional-fallback"}
-
-    def approve(self, feature_vector):
-        vector = np.asarray(feature_vector, dtype=np.float32)
-        if vector.ndim != 1 or vector.size < 10 or not np.all(np.isfinite(vector)):
-            raise ValueError("Invalid feature vector")
-        with self.lock:
-            self.normal_bank.append(vector)
-            self.normal_bank = self.normal_bank[-128:]
-            self.baseline = vector.copy()
-        return len(self.normal_bank)
+                print(f"ONNX inference failed ({exc}); using OpenCV features for this frame")
+                anomaly = edge_map
+        else:
+            # Robust per-frame normalization provides useful operation before a
+            # trained model is installed; global exposure changes are handled by guardrails.
+            q50, q995 = np.percentile(edge_map, [50, 99.5])
+            anomaly = np.clip((edge_map - q50) / max(float(q995 - q50), 1e-6), 0, 1)
+        anomaly = cv2.GaussianBlur(anomaly.astype(np.float32), (0, 0), 1.0)
+        return anomaly, self.embedding(image)
 
 
-engine = VisionEngine()
+engine = AnomalyEngine()

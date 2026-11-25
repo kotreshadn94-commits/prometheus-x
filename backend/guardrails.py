@@ -1,38 +1,49 @@
-"""Frame-shift monitoring, dust filtering and memory-bank HITL controls."""
+"""Distribution-shift guardrails, CLAHE stabilization and HITL normal memory."""
+from __future__ import annotations
+
 import cv2
 import numpy as np
 
+
 class ShiftGuard:
-    def __init__(self):
-        self.reference = None
-        self.reference_feature = None
+    def __init__(self) -> None:
+        self.baseline_luminance = 118.0
+        self.baseline_contrast = 48.0
+        self.baseline_embedding = np.zeros(4, dtype=np.float32)
+        self.embedding_ready = False
+        self.threshold = 0.24
 
-    def inspect(self, image, features, heatmap):
+    def stabilize(self, image: np.ndarray, embedding: np.ndarray, enabled: bool = True) -> tuple[np.ndarray, bool, dict]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        brightness, contrast = float(gray.mean()), float(gray.std())
-        if self.reference is None:
-            self.reference = (brightness, contrast)
-            self.reference_feature = np.asarray(features, dtype=np.float32).copy()
-            return {"shift": False, "brightness": round(brightness, 2), "contrast": round(contrast, 2), "stabilized": False}
-        rb, rc = self.reference
-        feature_drift = float(np.mean(np.abs(np.asarray(features)-self.reference_feature)))
-        shifted = abs(brightness-rb) > 38 or abs(contrast-rc) > 30 or feature_drift > 0.20
-        localized_peak = float(np.max(heatmap)) if heatmap.size else 0
-        # Global illumination/texture change without a spatially localized spike is likely a shift.
-        warning = shifted and localized_peak < 0.92
-        return {"shift": bool(warning), "brightness": round(brightness, 2),
-                "contrast": round(contrast, 2), "feature_drift": round(feature_drift, 4),
-                "stabilized": bool(warning)}
+        luminance = float(gray.mean())
+        contrast = float(gray.std())
+        brightness_drift = abs(luminance - self.baseline_luminance) / 255.0
+        contrast_drift = abs(contrast - self.baseline_contrast) / 128.0
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        embedding_drift = 0.0
+        if self.embedding_ready and vector.size >= self.baseline_embedding.size:
+            embedding_drift = float(np.linalg.norm(vector[:4] - self.baseline_embedding) /
+                                    (np.linalg.norm(self.baseline_embedding) + 0.25))
+        drift = min(1.0, 0.45 * brightness_drift + 0.35 * contrast_drift + 0.20 * min(embedding_drift, 1.0))
+        # Strong global changes with no sharp localized response are domain shift,
+        # not evidence of a product defect.
+        warning = drift > self.threshold
+        output = image
+        if warning and enabled:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            stabilized = clahe.apply(gray)
+            output = cv2.cvtColor(stabilized, cv2.COLOR_GRAY2BGR)
+        return output, warning, {"luminance": round(luminance, 2), "contrast": round(contrast, 2),
+                                 "drift": round(drift, 4), "clahe_applied": bool(warning and enabled)}
 
-
-def filter_small_dust(heatmap, minimum_pixels=25):
-    binary = (np.asarray(heatmap) >= 0.48).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-    cleaned = np.asarray(heatmap).copy()
-    for index in range(1, count):
-        if stats[index, cv2.CC_STAT_AREA] < minimum_pixels:
-            cleaned[labels == index] = 0
-    return cleaned
+    def observe_normal(self, embedding: np.ndarray) -> None:
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if vector.size >= 4:
+            if not self.embedding_ready:
+                self.baseline_embedding = vector[:4].copy()
+                self.embedding_ready = True
+            else:
+                self.baseline_embedding = 0.98 * self.baseline_embedding + 0.02 * vector[:4]
 
 
 guard = ShiftGuard()

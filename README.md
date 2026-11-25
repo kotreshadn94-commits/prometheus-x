@@ -1,50 +1,50 @@
 # PROMETHEUS-X
 
-A runnable industrial image-inspection and quality-assurance starter: FastAPI + SQLite backend, OpenCV anomaly/scratch screening, optional ONNX inference, and a single-page three-portal UI. The built-in OpenCV engine works without downloading a model. It is a useful inspection prototype, not a validated production metrology system; tune thresholds and validate on representative labeled factory data before using it for release decisions.
+Real-time industrial visual inspection and multi-stakeholder quality assurance. The app includes a FastAPI/SQLite service, ONNX PatchCore inference when a trained model is available, a working OpenCV directional-feature fallback, human review, batch audit records, and a responsive three-portal browser UI.
 
 ## Requirements
 
-- Python 3.10+ (tested design target: Python 3.11)
-- A modern browser; webcam access requires `localhost` or HTTPS.
-- Optional: a trained ONNX model at `backend/model.onnx`.
+- Python 3.10 or newer
+- A modern browser; camera access requires `localhost` or HTTPS
+- Optional: a trained MVTec AD PatchCore ONNX model at `backend/model.onnx`
 
-## Run locally
+## Install and run
 
 From the repository root:
 
 ```bash
 python -m venv .venv
-# Linux/macOS
+# macOS/Linux
 source .venv/bin/activate
 # Windows PowerShell: .venv\\Scripts\\Activate.ps1
 python -m pip install -r backend/requirements.txt
-cd backend
-python main.py
+python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Open http://127.0.0.1:8000. The database is created and seeded on first startup. Example serials: `PX-NUT-000184`, `PX-NUT-000185`, and `PX-HSG-000031`. Upload JPEG/PNG images in the Factory Console or Customer scanner. Camera access uses the browser's camera permission. The API docs are at http://127.0.0.1:8000/docs.
+Open <http://localhost:8000>. The API reference is at <http://localhost:8000/docs>. SQLite creates `backend/prometheus.db` and seeds sample batches and serial IDs on first startup. The database location can be changed with `PROMETHEUS_DB`.
 
-The B2B table uses seeded batch aggregate records. New image inspections are persisted in SQLite. Certificate lookups verify serial-to-batch linkage; a certificate preview appears once an inspection has been linked to that serial.
+The inference engine uses `backend/model.onnx` when present. Without the model it immediately runs the directional Sobel/Gabor OpenCV detector, so upload inspection, camera scans, customer reports, and review controls work without a training download. The fallback is an operational feature detector, not a trained PatchCore model; install a domain-trained model before relying on it for production acceptance decisions. ONNX location can be changed with `PROMETHEUS_MODEL`.
 
-## Optional PatchCore training/export
+## Train and export PatchCore
 
-The training script expects the MVTec AD dataset under `datasets/MVTec` and an anomalib/PyTorch environment compatible with its API. Install anomalib and its export dependencies separately, then run:
+Download/extract the MVTec AD dataset so the `metal_nut` category is available, then install the training dependencies in the training environment. For example:
 
 ```bash
-python -m pip install anomalib torch onnx
-python train_colab.py
+python -m pip install anomalib torch torchvision
+python train_colab.py --data ./datasets/MVTecAD
 ```
 
-The script selects `metal_nut`, configures PatchCore with `wide_resnet50_2`, `layer2`/`layer3`, and a 0.1 coreset sampling ratio, and exports `backend/model.onnx`. Dataset download/licensing is managed separately. Anomalib's APIs differ across releases; if your installed release changes export/model invocation APIs, pin a compatible anomalib version and adjust the adapter accordingly. The runtime inspects the ONNX input/output and falls back to directional OpenCV filters if the graph is missing or fails to load.
+Training reads the MVTec `metal_nut` training split (normal `train/good` samples) and exports the trained inference graph to `backend/model.onnx`. Training is optional; the application runs in fallback mode until the artifact exists.
 
-## API overview
+## Features and API
 
-- `POST /api/inspect` multipart fields: `file`, optional `batch_id`, `serial_id`, `stabilize`.
-- `GET /api/video_feed` streams a local OpenCV webcam when available; the browser camera flow is the more portable option.
-- `POST /api/hitl/approve` accepts a feature vector and a 45–65 confidence score.
-- `GET /api/batches`, `GET /api/certificate/{serial_id}`, `GET /api/customer/verify?serial_id=...`.
-- `GET /api/health` reports the selected inference path.
+- Factory portal: image upload, browser webcam, heatmap evidence, severity/verdict, shift simulation, stabilization, outcomes and HITL queue.
+- B2B portal: batch pass-rate and micro-scratch SLA audit view.
+- Customer portal: serial certificate verification and post-delivery self-check / report.
+- `POST /api/inspect` (multipart `file`, optional `batch_id`, `serial_id`, `auto_stabilize`, `role`)
+- `GET /api/video_feed` (MJPEG stream of the latest inspected frame)
+- `GET /api/hitl/queue`, `POST /api/hitl/approve` (`{"inspection_id": 1}`)
+- `GET /api/batches`, `GET /api/certificate/{serial_id}`, `POST /api/customer/verify`
+- `GET /api/health` and `GET /api/docs`
 
-## Implementation notes
-
-The fallback analyzes oriented Sobel and Gabor responses, small-object filtering removes connected components smaller than 25 pixels, and CLAHE is applied when a global brightness/contrast/feature drift is detected. The classifier uses transparent contour geometry heuristics. Confidence is a reproducible logistic curve fitted on generated score distributions; it is not a substitute for calibration against held-out production labels. The active HITL bank is in process memory, so approved samples are not persisted across server restarts (approval audit records are persisted). Use authenticated access, HTTPS, retention controls, independent model validation, and safety review before production deployment.
+Images and inspection metrics are persisted as inspection records; heatmap evidence is returned by the API in the inspection result. The application is a demonstration-quality inspection workflow and its severity thresholds, model quality, optics, and calibration must be validated against representative production data before being used for safety-critical release decisions.

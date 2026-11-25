@@ -1,161 +1,159 @@
-"""PROMETHEUS-X HTTP API."""
-from pathlib import Path
+"""PROMETHEUS-X API: image inspection, live feed, human review and certificates."""
+from __future__ import annotations
+
+import asyncio
 import time
+from typing import Annotated
+
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-import database
-from ai_engine import engine
-from guardrails import guard, filter_small_dust
-from postprocess import process
 
-app = FastAPI(title="PROMETHEUS-X Inspection & Quality Assurance", version="1.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-FRONTEND = Path(__file__).resolve().parents[1] / "frontend" / "index.html"
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+try:
+    from . import database
+    from .ai_engine import engine
+    from .guardrails import guard
+    from .postprocess import process_result
+except ImportError:
+    import database
+    from ai_engine import engine
+    from guardrails import guard
+    from postprocess import process_result
+
+app = FastAPI(title="PROMETHEUS-X", version="1.0.0", description="Industrial visual quality assurance API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["*"], allow_headers=["*"])
+latest_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+latest_lock = asyncio.Lock()
 
 
-@app.on_event("startup")
-def startup():
-    database.init_db()
+class Approval(BaseModel):
+    inspection_id: int = Field(gt=0)
 
 
-@app.get("/")
-def home():
-    return FileResponse(FRONTEND)
+class VerifyRequest(BaseModel):
+    serial_id: str
+
+
+async def decode_upload(file: UploadFile) -> np.ndarray:
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Uploaded image is empty")
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(415, "File is not a supported image")
+    if max(image.shape[:2]) > 2400:
+        scale = 2400 / max(image.shape[:2])
+        image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return image
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "engine": "onnx-patchcore+opencv" if engine.session else "opencv-directional-fallback"}
-
-
-async def inspect_bytes(contents, batch_id=None, serial_id=None, stabilize=False):
-    if not contents:
-        raise HTTPException(400, "An image file is required")
-    if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "Image upload exceeds the 20 MB limit")
-    started = time.perf_counter()
-    image = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise HTTPException(400, "Upload must be a readable image")
-    if image.shape[0] * image.shape[1] > 16_000_000:
-        raise HTTPException(413, "Image exceeds the 16 megapixel limit")
-    if batch_id:
-        with database.connect() as db:
-            if db.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone() is None:
-                raise HTTPException(404, "Batch ID not found")
-    if serial_id:
-        with database.connect() as db:
-            if db.execute("SELECT 1 FROM products WHERE serial_id=?", (serial_id,)).fetchone() is None:
-                raise HTTPException(404, "Product serial ID not found")
-
-    # Inspect the unmodified frame first. A global shift is diagnosed independently
-    # from localized defects; when enabled, CLAHE is then actually applied and run.
-    raw_result = engine.analyze(image, stabilize=False)
-    shift = guard.inspect(raw_result["image"], raw_result["features"], raw_result["heatmap"])
-    stabilized = bool(shift["shift"] and stabilize)
-    result = engine.analyze(image, stabilize=True) if stabilized else raw_result
-    heat = filter_small_dust(result["heatmap"])
-    vision = process(result["image"], heat)
-    if shift["shift"] and not stabilize:
-        vision["verdict"], vision["defect_type"], vision["severity"] = "REVIEW", "Distribution Shift", 0.0
-    shift["stabilized"] = stabilized
-    latency = (time.perf_counter() - started) * 1000
-    output = {**vision, "latency_ms": round(latency, 2), "engine": result["engine"],
-              "guardrail": shift, "features": result["features"].tolist(),
-              "created_at": time.time(), "batch_id": batch_id}
-    inspection_id = database.record_inspection({**output, "serial_id": serial_id,
-                                                  "image_data": vision["heatmap_image"]})
-    if serial_id:
-        with database.connect() as db:
-            db.execute("UPDATE products SET verdict=?,inspection_id=? WHERE serial_id=?",
-                       (vision["verdict"], inspection_id, serial_id))
-    output["inspection_id"] = inspection_id
-    return output
+    return {"status": "ok", "model": engine.model_mode, "memory_bank_entries": len(engine.memory_bank)}
 
 
 @app.post("/api/inspect")
-async def inspect(file: UploadFile = File(...), batch_id: str | None = Form(None),
-                  serial_id: str | None = Form(None), stabilize: bool = Form(False)):
-    return await inspect_bytes(await file.read(), batch_id, serial_id, stabilize)
-
-
-@app.get("/api/batches")
-def batches():
-    return {"batches": database.get_batches(), "inspections": database.recent_inspections(),
-            "serials": database.get_products()}
-
-
-@app.get("/api/batches/{batch_id}/inspections")
-def batch_inspections(batch_id: str, limit: int = 20):
-    """Return batch-specific inspection evidence for an authorized client portal."""
-    if not 1 <= limit <= 100:
-        raise HTTPException(400, "limit must be between 1 and 100")
-    with database.connect() as db:
-        if db.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone() is None:
-            raise HTTPException(404, "Batch ID not found")
-        rows = db.execute("""SELECT id, serial_id, verdict, defect_type, severity, confidence,
-                             latency_ms, created_at, image_data FROM inspections
-                             WHERE batch_id=? ORDER BY id DESC LIMIT ?""", (batch_id, limit)).fetchall()
-    return {"batch_id": batch_id, "inspections": [dict(row) for row in rows]}
-
-
-@app.get("/api/certificate/{serial_id}")
-def get_certificate(serial_id: str):
-    result = database.certificate(serial_id)
-    if not result:
-        raise HTTPException(404, "Serial number not found")
+async def inspect(file: Annotated[UploadFile, File()], batch_id: Annotated[str | None, Form()] = None,
+                  serial_id: Annotated[str | None, Form()] = None,
+                  auto_stabilize: Annotated[bool, Form()] = True,
+                  role: Annotated[str, Form()] = "factory"):
+    image = await decode_upload(file)
+    started = time.perf_counter()
+    raw_map, embedding = engine.infer(image)
+    stabilized, warning, shift_metrics = guard.stabilize(image, embedding, auto_stabilize)
+    if warning and auto_stabilize:
+        # Recompute after CLAHE so localized evidence is not dominated by exposure drift.
+        raw_map, embedding = engine.infer(stabilized)
+    elapsed = (time.perf_counter() - started) * 1000
+    result = process_result(stabilized, raw_map, elapsed, warning)
+    result.update({"model": engine.model_mode, "shift_metrics": shift_metrics, "role": role,
+                   "embedding": [round(float(v), 6) for v in embedding[:4]]})
+    inspection_id = database.record_inspection(result, batch_id, serial_id)
+    result["inspection_id"] = inspection_id
+    if result["verdict"] == "PASS":
+        guard.observe_normal(embedding)
+    async with latest_lock:
+        global latest_frame
+        latest_frame = stabilized.copy()
     return result
 
 
-@app.get("/api/customer/verify")
-def verify(serial_id: str):
-    return get_certificate(serial_id)
+@app.get("/api/video_feed")
+async def video_feed():
+    async def frames():
+        while True:
+            async with latest_lock:
+                frame = latest_frame.copy()
+            ok, data = cv2.imencode(".jpg", frame)
+            if ok:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data.tobytes() + b"\r\n"
+            await asyncio.sleep(0.25)
+    return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-class Approval(BaseModel):
-    features: list[float] = Field(min_length=10, max_length=1100)
-    confidence: float = Field(ge=45, le=65)
-    note: str = Field(default="Operator verified normal", max_length=300)
+@app.get("/api/hitl/queue")
+def review_queue():
+    return {"items": database.get_review_queue(), "analytics": database.analytics()}
 
 
 @app.post("/api/hitl/approve")
 def approve(payload: Approval):
-    try:
-        count = engine.approve(payload.features)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    database.log_approval(payload.features, payload.note)
-    return {"approved": True, "memory_bank_size": count,
-            "message": "Normal sample added to the active memory bank."}
+    result = database.inspection_by_id(payload.inspection_id)
+    if not result:
+        raise HTTPException(404, "Inspection not found")
+    if result["confidence"] < 45 or result["confidence"] > 65:
+        raise HTTPException(422, "Only borderline confidence inspections (45–65%) can be approved")
+    if not database.approve_inspection(payload.inspection_id):
+        raise HTTPException(404, "Inspection not found")
+    embedding = result.get("embedding")
+    if embedding:
+        engine.inject_normal(embedding)
+    return {"approved": True, "inspection_id": payload.inspection_id,
+            "memory_bank_entries": len(engine.memory_bank)}
 
 
-_camera = None
+@app.get("/api/batches")
+def batches():
+    return {"batches": database.get_batches(), "analytics": database.analytics()}
 
 
-@app.get("/api/video_feed")
-def video_feed():
-    """Stream MJPEG from the server-attached camera, when available."""
-    global _camera
-    if _camera is None or not _camera.isOpened():
-        _camera = cv2.VideoCapture(0)
-    if not _camera.isOpened():
-        raise HTTPException(503, "No local webcam is available. Use browser camera capture or image upload.")
+@app.get("/api/certificate/{serial_id}")
+def certificate(serial_id: str):
+    item = database.get_serial(serial_id)
+    if not item:
+        raise HTTPException(404, "Serial number was not found in the verified product registry")
+    return item
 
-    def frames():
-        while _camera is not None and _camera.isOpened():
-            ok, frame = _camera.read()
-            if not ok:
-                break
-            encoded, jpg = cv2.imencode(".jpg", frame)
-            if encoded:
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
 
-    return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+@app.post("/api/customer/verify")
+def verify_customer(payload: VerifyRequest):
+    item = database.get_serial(payload.serial_id)
+    if not item:
+        raise HTTPException(404, "This serial number is not present in the product registry")
+    return {"verified": True, "serial_id": item["serial_id"], "certificate_id": item["certificate_id"],
+            "verdict": item["verdict"], "product": item["product"]}
+
+
+@app.get("/api/inspections/{inspection_id}")
+def inspection_detail(inspection_id: int):
+    result = database.inspection_by_id(inspection_id)
+    if not result:
+        raise HTTPException(404, "Inspection not found")
+    return result
+
+
+_FRONTEND = __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend"
+if _FRONTEND.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_FRONTEND)), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(_FRONTEND / "index.html")
 
 
 if __name__ == "__main__":
